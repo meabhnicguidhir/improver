@@ -36,6 +36,7 @@ import iris
 from iris.exceptions import CoordinateNotFoundError
 import numpy as np
 import scipy.ndimage.filters
+import time
 
 from improver.utilities.cube_manipulation import concatenate_cubes
 
@@ -239,7 +240,7 @@ class SquareNeighbourhood(object):
         return result.format(self.unweighted_mode)
 
     @staticmethod
-    def mean_over_neighbourhood(cube, cells_x, cells_y):
+    def mean_over_neighbourhood(cube, cells_x, cells_y, nan_mask):
         """
         Method to calculate the average value in a square neighbourhood using
         the 4-point algorithm to find the total sum over the neighbourhood.
@@ -326,7 +327,7 @@ class SquareNeighbourhood(object):
 
         yname = cube.coord(axis="y").name()
         xname = cube.coord(axis="x").name()
-
+        #print cube.data
         # Calculate displacement factors to find 4-points after flattening the
         # array.
         n_rows = len(cube.coord(axis="y").points)
@@ -350,7 +351,7 @@ class SquareNeighbourhood(object):
             neighbourhood_total = (ymax_xmax_array - ymin_xmax_array +
                                    ymin_xmin_array - ymax_ymin_array)
             neighbourhood_total.resize(n_rows, n_columns)
-
+            #print neighbourhood_total
             # Initialise the neighbourhood size array and calculate
             # neighbourhood size for non edge cases.
             neighbourhood_area = np.zeros(neighbourhood_total.shape)
@@ -358,22 +359,27 @@ class SquareNeighbourhood(object):
             # Calculate total sum and area of neighbourhood for edge cases.
             # NOTE: edge cases could be dealt with more efficiently.
             # If neighbourhoods get large, this method will need revision.
-            edge_rows = (range(min(cells_x*2, n_rows)) +
-                         range(max(n_rows-2*cells_x, 0), n_rows))
-            edge_columns = (range(min(cells_x*2, n_columns)) +
-                            range(max(n_columns-2*cells_x, 0), n_columns))
-            for j in range(n_rows):
-                for i in (edge_columns):
-                    neighbourhood_total[j, i], neighbourhood_area[j, i] = (
-                        _sum_and_area_for_edge_cases(
-                            slice_2d, cells_x, cells_y, i, j))
-            for i in range(n_columns):
-                for j in (edge_rows):
-                    neighbourhood_total[j, i], neighbourhood_area[j, i] = (
-                        _sum_and_area_for_edge_cases(
-                            slice_2d, cells_x, cells_y, i, j))
-            slice_2d.data = neighbourhood_total/neighbourhood_area
+            #if not mask_flag:
+                #edge_rows = (range(min(cells_x*2, n_rows)) +
+                              #range(max(n_rows-2*cells_x, 0), n_rows))
+                #edge_columns = (range(min(cells_x*2, n_columns)) +
+                                #range(max(n_columns-2*cells_x, 0), n_columns))
+                #for j in range(n_rows):
+                    #for i in (edge_columns):
+                        #neighbourhood_total[j, i], neighbourhood_area[j, i] = (
+                            #_sum_and_area_for_edge_cases(
+                                #slice_2d, cells_x, cells_y, i, j))
+                #for i in range(n_columns):
+                    #for j in (edge_rows):
+                        #neighbourhood_total[j, i], neighbourhood_area[j, i] = (
+                            #_sum_and_area_for_edge_cases(
+                                #slice_2d, cells_x, cells_y, i, j))
+            with np.errstate(invalid='ignore', divide='ignore'):
+                slice_2d.data = (neighbourhood_total.astype(float) /
+                                  neighbourhood_area.astype(float))
+            slice_2d.data[nan_mask] = np.NaN
             cubelist.append(slice_2d)
+            #print slice_2d.data
         return cubelist.merge_cube()
 
     @staticmethod
@@ -403,11 +409,133 @@ class SquareNeighbourhood(object):
         cubelist = iris.cube.CubeList([])
         for slice_2d in cube.slices([yname, xname]):
             data = slice_2d.data
+            nan_mask = np.isnan(data)
+            data[nan_mask] = 0
             data_summed_along_y = np.cumsum(data, axis=0)
             data_summed_along_x = (
                 np.cumsum(data_summed_along_y, axis=1))
             slice_2d.data = data_summed_along_x
             cubelist.append(slice_2d)
+        return cubelist.merge_cube(), nan_mask
+
+    @staticmethod
+    def pad_coord(coord, width, method):
+        """
+        Construct a new coordinate by extending the current coordinate by the
+        padding width.
+
+        Args:
+            coord : iris.coord
+                Original coordinate which will be used as the basis of the
+                new extended coordinate.
+            width : integer
+                The width of padding in grid cells (the extent of the
+                neighbourhood radius in grid cells in a given direction).
+            method : string
+                A string determining whether the coordinate is being expanded
+                or contracted. Options: 'remove' to remove points from coord;
+                'add' to add points to coord.
+
+        Returns:
+          new_coord : iris.coord
+              Coordinate with expanded or contracted length, to be added to the
+              padded or unpadded iris cube.
+        """
+        orig_points = coord.points
+        if method == 'add':
+            orig_del = orig_points[1] - orig_points[0]
+            pre_points = np.linspace(orig_points.min() - (2*width + 1)*orig_del,
+                                    orig_points.min() - orig_del, 2*width)
+            post_points = np.linspace(orig_points.max() + orig_del,
+                                      orig_points.max() + (2*width + 1)*orig_del, 2*width)
+            new_points = np.float32(np.append(
+                np.append(pre_points, orig_points), post_points))
+        elif method == 'remove':
+            new_points = np.float32(orig_points[2*width:-2*width])
+        new_coord = iris.coords.DimCoord(
+            new_points, coord.name(), coord_system=coord.coord_system, units=coord.units)
+        return new_coord
+
+    @staticmethod
+    def pad_cube(cube, width_x, width_y):
+        """
+        Method to pad an iris cube with 0s.
+
+        Args:
+            cube : iris.cube.Cube
+                The original cube to be padded out with zeros.
+            width_x, width_y : integer
+                The width in x and y directions of the neighbourhood radius in
+                grid cells. This will be the width of zeros added to the numpy
+                array.
+
+        Returns:
+            iris.cube.Cube
+                Cube containing the new zero padded cube, with appropriate
+                changes to the cube's dimension coordinates.
+        """
+        yname = cube.coord(axis='y')
+        xname = cube.coord(axis='x')
+        cubelist = iris.cube.CubeList([])
+        for slice_2d in cube.slices([yname, xname]):
+            padded_data = np.pad(slice_2d.data.squeeze(), (2*width_y, 2*width_x), 'constant')
+            orig_x = cube.coord(axis='x')
+            new_x = SquareNeighbourhood.pad_coord(orig_x, width_x, 'add')
+            orig_y = cube.coord(axis='y')
+            new_y = SquareNeighbourhood.pad_coord(orig_y, width_y, 'add')
+            new_cube = iris.cube.Cube(padded_data, long_name=cube.name())
+            for coord in slice_2d.coords():
+                if coord.name() not in [yname.name(), xname.name()]:
+                    dim = slice_2d.coord_dims(coord)
+                    if dim:
+                        new_cube.add_dim_coord(coord, dim)
+                    else:
+                        new_cube.add_aux_coord(coord)
+            new_cube.add_dim_coord(new_x, 1)    
+            new_cube.add_dim_coord(new_y, 0)
+            cubelist.append(new_cube)
+        return cubelist.merge_cube()
+
+    @staticmethod
+    def unpad_cube(cube, width_x, width_y):
+        """
+        Method to remove rows/columnds from the edge of an iris cube.
+        Used to 'unpad' cubes which have been previously padded by pad_cube.
+
+        Args:
+            cube : iris.cube.Cube
+                The original cube to be trimmed of edge data.
+            width_x, width_y : integer
+                The width in x and y directions of the neighbourhood radius in
+                grid cells. This will be the width removed from the numpy
+                array.
+
+        Returns:
+            iris.cube.Cube
+                Cube containing the new trimmed cube, with appropriate
+                changes to the cube's dimension coordinates.
+        """
+        yname = cube.coord(axis='y')
+        xname = cube.coord(axis='x')
+        cubelist = iris.cube.CubeList([])
+        for slice_2d in cube.slices([yname, xname]):
+            unpadded_data = slice_2d.data[2*width_y:-2*width_y,
+                                          2*width_x:-2*width_x]
+            orig_x = slice_2d.coord(axis='x')
+            new_x = SquareNeighbourhood.pad_coord(orig_x, width_x, 'remove')
+            orig_y = slice_2d.coord(axis='y')
+            new_y = SquareNeighbourhood.pad_coord(orig_y, width_y, 'remove')
+            new_cube = iris.cube.Cube(unpadded_data, long_name=cube.name())
+            for coord in slice_2d.coords():
+                if coord.name() not in [yname.name(), xname.name()]:
+                    dim = slice_2d.coord_dims(coord)
+                    if dim:
+                        new_cube.add_dim_coord(coord, dim)
+                    else:
+                        new_cube.add_aux_coord(coord)
+            new_cube.add_dim_coord(new_x, 1)
+            new_cube.add_dim_coord(new_y, 0)
+            cubelist.append(new_cube)
         return cubelist.merge_cube()
 
     @staticmethod
@@ -431,21 +559,65 @@ class SquareNeighbourhood(object):
             Cube containing the smoothed field after the square neighbourhood
             method has been applied.
         """
-        if isinstance(cube.data, np.ma.MaskedArray):
-            msg = ('Masked data is not currently supported in ',
-                   'SquareNeighbourhood.')
-            raise ValueError(msg)
+        masked_flag = False
         if np.any(np.isnan(cube.data)):
             msg = ('Data array contains NaNs which are not currently ',
                    'supported in SquareNeighbourhood.')
             raise ValueError(msg)
-        summed_up_cube = SquareNeighbourhood.cumulate_array(cube)
-        grid_cells_x, grid_cells_y = (
-            Utilities.get_neighbourhood_width_in_grid_cells(
-                summed_up_cube, radius, MAX_RADIUS_IN_GRID_CELLS))
-        neighbourhood_averaged_cube = (
-            SquareNeighbourhood.mean_over_neighbourhood(
-                summed_up_cube, grid_cells_x, grid_cells_y))
+        # If the data is masked, the mask will be processed as well as the
+        # original_data * mask array.
+        original_attributes = cube.attributes
+        original_methods = cube.cell_methods
+        #print cube.data
+        # If there is no mask, make a mask of ones. This will speed up the
+        # calculation.
+        mask_cube = cube.copy()
+        mask_cube.rename('mask_data')
+        cubes_to_sum = iris.cube.CubeList([cube, mask_cube])
+        if isinstance(cube.data, np.ma.MaskedArray):
+            masked_flag = True
+            mask_cube.data = np.logical_not(cube.data.mask.astype(int))
+            cube.data = cube.data.data * mask_cube.data
+        #print mask_cube.data
+        #print cube.data
+        cubes_to_sum = iris.cube.CubeList([cube, mask_cube])
+        neighbourhood_averaged_cubes = iris.cube.CubeList([])
+        for cube_to_process in cubes_to_sum:
+            grid_cells_x, grid_cells_y = (
+                Utilities.get_neighbourhood_width_in_grid_cells(
+                    cube_to_process, radius, MAX_RADIUS_IN_GRID_CELLS))
+            # Pad the iris cube with zeros. This way, the edge effects produced
+            # by the vectorisation of the 4-point method will appear outside
+            # our domain of interest. These unwanted points can be trimmed off
+            # later.
+            cube_to_process = SquareNeighbourhood.pad_cube(
+                cube_to_process, grid_cells_x, grid_cells_y)
+            #print cube.data
+            summed_up_cube, nan_mask = SquareNeighbourhood.cumulate_array(
+                cube_to_process)
+            #print summed_up_cube.data
+            neighbourhood_averaged_cubes.append(
+                SquareNeighbourhood.mean_over_neighbourhood(
+                    summed_up_cube, grid_cells_x, grid_cells_y, nan_mask))
+
+        # Correct neighbourhood averages for masked data, which may have been
+        # calculated using larger neighbourhood areas than are present in
+        # reality.
+        neighbourhood_averaged_cube, = neighbourhood_averaged_cubes.extract(
+            cube.name())
+        neighbourhood_averaged_cube = SquareNeighbourhood.unpad_cube(
+            neighbourhood_averaged_cube, grid_cells_x, grid_cells_y)
+        mask_probs, = neighbourhood_averaged_cubes.extract('mask_data')
+        mask_probs = SquareNeighbourhood.unpad_cube(
+            mask_probs, grid_cells_x, grid_cells_y)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            neighbourhood_averaged_cube.data = (
+                neighbourhood_averaged_cube.data/mask_probs.data)
+        neighbourhood_averaged_cube.data = (
+            np.ma.masked_where(np.logical_not(mask_cube.data.squeeze()),
+                                neighbourhood_averaged_cube.data))
+        neighbourhood_averaged_cube.cell_methods = original_methods
+        neighbourhood_averaged_cube.attributes = original_attributes
         return neighbourhood_averaged_cube
 
 
@@ -717,8 +889,12 @@ class NeighbourhoodProcessing(object):
         for cube_realization in slices_over_realization:
             if self.lead_times is None:
                 radius = self._find_radii(num_ens)
+                print 'start'
+                t0=time.time()
                 cube_new = self.neighbourhood_method.run(cube_realization,
                                                          radius)
+                t1=time.time()
+                print 'end:',t1-t0
             else:
                 cube_lead_times = (
                     Utilities.find_required_lead_times(cube_realization))
@@ -734,8 +910,12 @@ class NeighbourhoodProcessing(object):
                 for cube_slice, radius in (
                         zip(cube_realization.slices_over("time"),
                             required_radii)):
+                    print 'start'
+                    t0 = time.time()
                     cube_slice = self.neighbourhood_method.run(
                         cube_slice, radius)
+                    t1=time.time()
+                    print 'end:', t1-t0
                     cube_slice = iris.util.new_axis(cube_slice, "time")
                     cubes.append(cube_slice)
                 cube_new = concatenate_cubes(cubes,
